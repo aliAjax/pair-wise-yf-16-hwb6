@@ -1,125 +1,265 @@
+import { useState } from "react";
 import "./styles.css";
+import { BrushRack } from "./components/BrushRack";
+import { HistoryPanel } from "./components/HistoryPanel";
+import { OrderCard } from "./components/OrderCard";
+import { OrderForm } from "./components/OrderForm";
+import {
+  BOARD_TYPES,
+  INITIAL_BRUSHES,
+  INITIAL_HISTORY,
+  INITIAL_ORDERS,
+  WAX_TYPES,
+  ZONE_LABEL,
+} from "./data";
+import { assignBrushes, blockersOf, now, waxOf } from "./logic";
+import type { BoardOrder, Brush, HistoryRecord, OrderDraft, OrderStatus } from "./types";
 
-const project = {
-  "sourceNo": 6,
-  "id": "hxyfront-62004",
-  "port": 62004,
-  "title": "滑雪板调校维护",
-  "domain": "滑雪装备调校",
-  "prompt": "我想做一个面向滑雪板调校店的装备维护前端系统，技师可以记录雪板品牌、长度、板型、刃角、打蜡类型、底板损伤、修补位置和客户偏好。页面需要有维护工单列表、刃角参数表、底板损伤标记区、完工状态筛选和客户历史维护记录。",
-  "palette": [
-    "#0369a1",
-    "#14b8a6",
-    "#f97316"
-  ],
-  "metrics": [
-    "待维护",
-    "完工工单",
-    "平均刃角",
-    "底板修补"
-  ],
-  "filters": [
-    "全地域",
-    "公园板",
-    "竞速板",
-    "粉雪板"
-  ],
-  "fields": [
-    "雪板品牌",
-    "长度",
-    "板型",
-    "刃角",
-    "打蜡类型",
-    "底板损伤"
-  ],
-  "records": [
-    [
-      "ORD-106",
-      "Burton 156",
-      "侧刃88°，底刃1°",
-      "已打低温蜡"
-    ],
-    [
-      "ORD-112",
-      "竞速板165",
-      "底板划痕12cm",
-      "待补P-Tex"
-    ],
-    [
-      "ORD-118",
-      "粉雪板158",
-      "客户偏好弱咬雪",
-      "待交付"
-    ]
-  ]
-};
+const STATUS_FILTERS: { key: "all" | OrderStatus; label: string }[] = [
+  { key: "all", label: "全部" },
+  { key: "prep", label: "待准备" },
+  { key: "waxing", label: "打蜡中" },
+  { key: "done", label: "已完工" },
+];
+
+const STATUS_RANK: Record<OrderStatus, number> = { prep: 0, waxing: 1, done: 2 };
 
 function App() {
+  const [orders, setOrders] = useState<BoardOrder[]>(INITIAL_ORDERS);
+  const [brushes, setBrushes] = useState<Brush[]>(INITIAL_BRUSHES);
+  const [history, setHistory] = useState<HistoryRecord[]>(INITIAL_HISTORY);
+  const [nextNo, setNextNo] = useState(204);
+  const [statusFilter, setStatusFilter] = useState<"all" | OrderStatus>("all");
+  const [typeFilter, setTypeFilter] = useState("全部");
+
+  // 每次状态变化后，为仍在待准备且没有刷具的工单尝试占用刷具
+  function commit(nextOrders: BoardOrder[], nextBrushes: Brush[]) {
+    const assigned = assignBrushes(nextOrders, nextBrushes);
+    setOrders(assigned.orders);
+    setBrushes(assigned.brushes);
+  }
+
+  function registerOrder(draft: OrderDraft) {
+    const order: BoardOrder = {
+      ...draft,
+      id: `ORD-${nextNo}`,
+      brushId: null,
+      status: "prep",
+      createdAt: now(),
+      finishedAt: null,
+    };
+    setNextNo((n) => n + 1);
+    commit([...orders, order], brushes);
+  }
+
+  // 刷具换温区前登记清洁：清掉刷毛上的蜡残留
+  function cleanBrush(brushId: string) {
+    commit(
+      orders,
+      brushes.map((b) =>
+        b.id === brushId ? { ...b, residueZone: null, lastCleanedAt: now() } : b
+      )
+    );
+  }
+
+  function startWaxing(orderId: string) {
+    const order = orders.find((o) => o.id === orderId);
+    if (!order || blockersOf(order, brushes).length > 0) return;
+    commit(
+      orders.map((o) => (o.id === orderId ? { ...o, status: "waxing" } : o)),
+      brushes
+    );
+  }
+
+  function saveRepair(orderId: string, spots: string) {
+    commit(
+      orders.map((o) => (o.id === orderId ? { ...o, repairSpots: spots } : o)),
+      brushes
+    );
+  }
+
+  function changeEdge(orderId: string, edgeAngle: string) {
+    commit(
+      orders.map((o) => (o.id === orderId ? { ...o, edgeAngle } : o)),
+      brushes
+    );
+  }
+
+  function finishOrder(orderId: string) {
+    const order = orders.find((o) => o.id === orderId);
+    if (!order || order.status !== "waxing" || !order.brushId) return;
+    const brush = brushes.find((b) => b.id === order.brushId);
+    if (!brush) return;
+    const wax = waxOf(order);
+    const finishedAt = now();
+
+    // 客户历史保留当次蜡型、刷具与刃角结果
+    const record: HistoryRecord = {
+      id: `HIS-${String(history.length + 1).padStart(2, "0")}`,
+      orderId: order.id,
+      customer: order.customer,
+      board: `${order.brand} ${order.length}cm · ${order.boardType}`,
+      waxName: wax.name,
+      brushLabel: `${brush.id} ${brush.name}`,
+      edgeAngle: order.edgeAngle,
+      finishedAt,
+    };
+    setHistory((h) => [record, ...h]);
+
+    // 完工释放刷具，刷毛上留下当次蜡的温区残留
+    commit(
+      orders.map((o) => (o.id === orderId ? { ...o, status: "done", finishedAt } : o)),
+      brushes.map((b) =>
+        b.id === brush.id ? { ...b, occupiedBy: null, residueZone: wax.zone } : b
+      )
+    );
+  }
+
+  const visible = orders
+    .filter((o) => statusFilter === "all" || o.status === statusFilter)
+    .filter((o) => typeFilter === "全部" || o.boardType === typeFilter)
+    .slice()
+    .sort(
+      (a, b) =>
+        STATUS_RANK[a.status] - STATUS_RANK[b.status] ||
+        a.createdAt.localeCompare(b.createdAt)
+    );
+
+  const metrics = [
+    { label: "待准备工单", value: orders.filter((o) => o.status === "prep").length },
+    { label: "打蜡中", value: orders.filter((o) => o.status === "waxing").length },
+    { label: "今日完工", value: orders.filter((o) => o.status === "done").length },
+    {
+      label: "待清洁刷具",
+      value: brushes.filter((b) => !b.occupiedBy && b.residueZone !== null).length,
+    },
+  ];
+
   return (
     <main className="app">
       <section className="hero">
-        <p>{project.id} · 源提示词{project.sourceNo} · Port {project.port}</p>
-        <h1>{project.title}</h1>
-        <span>{project.prompt}</span>
+        <p>hxyfront-62004 · 源提示词6 · Port 62004</p>
+        <h1>滑雪板调校 · 打蜡准备台</h1>
+        <span>
+          按雪温温区调度蜡与刷具：登记雪板品牌、长度、板型、刃角与底板损伤，选定蜡型即占用对应温区刷具；
+          刷具换温区前必须登记清洁完成，否则下一块板停在待准备；底板损伤未登记修补位置不得开工；
+          完工释放刷具，客户历史保留当次蜡型、刷具与刃角结果。
+        </span>
       </section>
 
       <section className="metrics">
-        {project.metrics.map((metric: string, index: number) => (
-          <article key={metric}>
-            <small>{metric}</small>
-            <strong>{[86, 14, 7, 32][index] ?? 12}</strong>
+        {metrics.map((m) => (
+          <article key={m.label}>
+            <small>{m.label}</small>
+            <strong>{m.value}</strong>
           </article>
         ))}
       </section>
 
       <section className="workspace">
-        <aside className="panel">
-          <h2>{project.domain}筛选</h2>
-          <div className="chips">
-            {project.filters.map((item: string) => (
-              <button key={item}>{item}</button>
-            ))}
-          </div>
+        <aside className="side">
+          <section className="panel">
+            <div className="heading">
+              <div>
+                <p>刷具架</p>
+                <h2>温区占用与清洁</h2>
+              </div>
+            </div>
+            <BrushRack brushes={brushes} orders={orders} onClean={cleanBrush} />
+          </section>
+
+          <section className="panel">
+            <div className="heading">
+              <div>
+                <p>蜡型温区</p>
+                <h2>本季蜡谱</h2>
+              </div>
+            </div>
+            <div className="wax-list">
+              {WAX_TYPES.map((w) => (
+                <div key={w.id} className="wax-item">
+                  <strong>{w.name}</strong>
+                  <span className={`badge ${w.zone}`}>{ZONE_LABEL[w.zone]}</span>
+                  <span className="hint">{w.range}</span>
+                </div>
+              ))}
+            </div>
+          </section>
         </aside>
 
         <section className="panel form-panel">
           <div className="heading">
             <div>
-              <p>专业字段</p>
-              <h2>新增记录</h2>
+              <p>登记新板</p>
+              <h2>打蜡准备登记</h2>
             </div>
-            <button className="primary">保存草稿</button>
           </div>
-          <div className="field-grid">
-            {project.fields.map((field: string) => (
-              <label key={field}>
-                <span>{field}</span>
-                <input placeholder={"填写" + field} />
-              </label>
-            ))}
-          </div>
+          <OrderForm brushes={brushes} onSubmit={registerOrder} />
         </section>
       </section>
 
       <section className="panel">
         <div className="heading">
           <div>
-            <p>历史记录</p>
-            <h2>近期工作台</h2>
+            <p>工单队列</p>
+            <h2>打蜡准备流程</h2>
           </div>
-          <button>导出摘要</button>
         </div>
-        <div className="records">
-          {project.records.map((record: string[], index: number) => (
-            <article key={record.join("-")}>
-              <b>{String(index + 1).padStart(2, "0")}</b>
-              <div>
-                <h3>{record[0]}</h3>
-                <p>{record.slice(1).join(" · ")}</p>
-              </div>
-            </article>
+        <div className="filter-rows">
+          <div className="filter-row">
+            <span className="filter-label">状态</span>
+            <div className="chips">
+              {STATUS_FILTERS.map((f) => (
+                <button
+                  key={f.key}
+                  className={statusFilter === f.key ? "active" : ""}
+                  onClick={() => setStatusFilter(f.key)}
+                >
+                  {f.label}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="filter-row">
+            <span className="filter-label">板型</span>
+            <div className="chips">
+              {["全部", ...BOARD_TYPES].map((t) => (
+                <button
+                  key={t}
+                  className={typeFilter === t ? "active" : ""}
+                  onClick={() => setTypeFilter(t)}
+                >
+                  {t}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+        <div className="queue-grid">
+          {visible.map((order) => (
+            <OrderCard
+              key={order.id}
+              order={order}
+              brushes={brushes}
+              onStart={startWaxing}
+              onFinish={finishOrder}
+              onSaveRepair={saveRepair}
+              onEdgeChange={changeEdge}
+            />
           ))}
+          {visible.length === 0 && <p className="empty">当前筛选条件下没有工单</p>}
         </div>
+      </section>
+
+      <section className="panel">
+        <div className="heading">
+          <div>
+            <p>客户历史</p>
+            <h2>维护记录</h2>
+          </div>
+          <span className="hint">每单保留当次蜡型、刷具与刃角结果</span>
+        </div>
+        <HistoryPanel history={history} />
       </section>
     </main>
   );
